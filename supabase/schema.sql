@@ -192,9 +192,16 @@ create policy "mindmaps: crud via owned course"
 -- =========================================================
 -- STORAGE — bucket privé pour l'audio des cours
 -- =========================================================
-insert into storage.buckets (id, name, public)
-values ('course-audio', 'course-audio', false)
-on conflict (id) do nothing;
+-- file_size_limit explicite à 50 MiB — c'est le PLAFOND GLOBAL du plan Free
+-- Supabase (testé : toute valeur au-delà est rejetée par Supabase lui-même,
+-- au niveau du bucket comme du projet). Pour supporter des cours de 2-3h,
+-- il faut d'abord relever la limite globale du projet dans le Dashboard
+-- (Project Settings > Storage > "Global file size limit" — nécessite
+-- généralement un plan payant), puis remonter cette valeur ici en
+-- conséquence, ex. 524288000 pour 500 MiB.
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('course-audio', 'course-audio', false, 52428800)
+on conflict (id) do update set file_size_limit = 52428800;
 
 -- Chemin attendu: <user_id>/<course_id>.webm — chaque utilisateur ne peut
 -- lire/écrire que dans son propre dossier.
