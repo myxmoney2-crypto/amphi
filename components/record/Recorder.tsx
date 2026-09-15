@@ -16,6 +16,17 @@ type Phase = "setup" | "ready" | "recording" | "stopped" | "uploading" | "proces
 // musique) aurait produit un fichier 4 à 8 fois plus gros pour rien.
 const AUDIO_BITS_PER_SECOND = 32_000;
 
+// L'API Whisper (OpenAI) plafonne à 25 Mo PAR FICHIER, indépendamment de la
+// limite de notre bucket Supabase (50 Mo) — un cours d'1h20+ dépasse déjà
+// cette limite et Whisper renvoie une 413. On enregistre donc en plusieurs
+// segments indépendants plutôt qu'un seul fichier continu : chaque segment
+// est un webm valide à part entière (MediaRecorder redémarré sur le même
+// flux, sans jamais couper le micro), transcrit séparément côté Edge
+// Function, puis les transcriptions sont concaténées avant structuration.
+// 15 min à 32kbps ≈ 3,6 Mo, très loin de la limite même si le débit réel
+// dérive au-delà de ce qui est demandé au navigateur.
+const SEGMENT_DURATION_MS = 15 * 60 * 1000;
+
 function pickMimeType(): string {
   const candidates = [
     "audio/webm;codecs=opus",
@@ -77,6 +88,11 @@ function getAudioDuration(blob: Blob): Promise<number> {
   });
 }
 
+async function getTotalAudioDuration(segments: Blob[]): Promise<number> {
+  const durations = await Promise.all(segments.map(getAudioDuration));
+  return durations.reduce((total, d) => total + (Number.isFinite(d) ? d : 0), 0);
+}
+
 export default function Recorder({ initialSubjects }: { initialSubjects: Subject[] }) {
   const router = useRouter();
   const supabase = createClient();
@@ -93,19 +109,20 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
   const [durationWarning, setDurationWarning] = useState<string | null>(null);
   const [micInterrupted, setMicInterrupted] = useState(false);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  const activeRecorderRef = useRef<MediaRecorder | null>(null);
+  const segmentsRef = useRef<Blob[]>([]); // segments audio terminés, prêts à uploader
   const streamRef = useRef<MediaStream | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const audioBlobRef = useRef<Blob | null>(null);
+  const mimeTypeRef = useRef<string>("audio/webm");
+  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const segmentTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const phaseRef = useRef<Phase>("ready");
   phaseRef.current = phase;
-  // true seulement quand c'est l'utilisateur qui a cliqué sur Stop — permet
-  // à `recorder.onstop` de distinguer un arrêt volontaire d'un arrêt
-  // provoqué par le navigateur lui-même (piste audio terminée).
-  const userInitiatedStopRef = useRef(false);
+  // true seulement quand c'est l'utilisateur qui a cliqué sur Stop (ou que le
+  // micro a été coupé) — permet au `onstop` du DERNIER segment de distinguer
+  // une simple bascule vers un nouveau segment d'un arrêt définitif.
+  const isFinalStopRef = useRef(false);
 
   async function acquireWakeLock() {
     try {
@@ -123,9 +140,6 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
   }
 
   useEffect(() => {
-    // Le Wake Lock est automatiquement relâché quand l'onglet passe en
-    // arrière-plan — on le redemande dès qu'il redevient visible, pour
-    // limiter la mise en veille de l'écran pendant un enregistrement long.
     function handleVisibility() {
       if (document.visibilityState === "visible" && phaseRef.current === "recording") {
         acquireWakeLock();
@@ -133,8 +147,6 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
     }
     document.addEventListener("visibilitychange", handleVisibility);
 
-    // Avertit avant de fermer l'onglet pendant un enregistrement en cours :
-    // les chunks ne sont qu'en mémoire, tout serait perdu.
     function handleBeforeUnload(e: BeforeUnloadEvent) {
       if (phaseRef.current === "recording") {
         e.preventDefault();
@@ -147,10 +159,77 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("beforeunload", handleBeforeUnload);
       streamRef.current?.getTracks().forEach((t) => t.stop());
-      if (timerRef.current) clearInterval(timerRef.current);
+      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+      if (segmentTimerRef.current) clearInterval(segmentTimerRef.current);
       releaseWakeLock();
     };
   }, []);
+
+  /** Crée et démarre un nouveau MediaRecorder sur le flux courant ; son
+   * propre `onstop` empile le segment terminé dans `segmentsRef`. */
+  function createSegmentRecorder(stream: MediaStream, mimeType: string): MediaRecorder {
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: AUDIO_BITS_PER_SECOND });
+    } catch {
+      // Au cas où le navigateur refuse audioBitsPerSecond pour ce mimeType.
+      recorder = new MediaRecorder(stream, { mimeType });
+    }
+    const myChunks: Blob[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) myChunks.push(e.data);
+    };
+    // `onstop` est le SEUL endroit fiable pour finaliser un segment : le
+    // navigateur peut arrêter le MediaRecorder de son propre chef (piste
+    // terminée) sans jamais passer par notre code — un test l'a confirmé.
+    recorder.onstop = () => {
+      if (myChunks.length > 0) {
+        segmentsRef.current.push(new Blob(myChunks, { type: mimeType }));
+      }
+      if (isFinalStopRef.current) {
+        finalizeRecording();
+      }
+    };
+    recorder.start(1000);
+    return recorder;
+  }
+
+  /** Bascule vers un nouveau segment sans jamais couper le flux micro : le
+   * nouvel enregistreur démarre AVANT que l'ancien ne s'arrête, pour qu'il
+   * n'y ait aucun trou de capture au moment de la bascule. */
+  function rotateSegment() {
+    const stream = streamRef.current;
+    if (!stream || phaseRef.current !== "recording") return;
+    const oldRecorder = activeRecorderRef.current;
+    activeRecorderRef.current = createSegmentRecorder(stream, mimeTypeRef.current);
+    oldRecorder?.stop();
+  }
+
+  async function finalizeRecording() {
+    if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+    if (segmentTimerRef.current) clearInterval(segmentTimerRef.current);
+    releaseWakeLock();
+
+    // Vérifie que la durée réellement capturée (somme des segments)
+    // correspond au temps écoulé — si le micro a été coupé en cours de
+    // route, ça se verra ici plutôt que de découvrir un fichier tronqué
+    // après coup.
+    const wallClockSeconds = startTimeRef.current
+      ? (Date.now() - startTimeRef.current) / 1000
+      : elapsed;
+    const totalDuration = await getTotalAudioDuration(segmentsRef.current);
+    if (totalDuration > 0 && totalDuration < wallClockSeconds * 0.9 - 5) {
+      const missing = Math.round(wallClockSeconds - totalDuration);
+      setDurationWarning(
+        `L'audio capturé (${formatElapsed(Math.round(totalDuration))}) est plus court que ` +
+          `la durée de l'enregistrement (${formatElapsed(Math.round(wallClockSeconds))}) : ` +
+          `environ ${formatElapsed(missing)} semblent manquants, probablement dus à une ` +
+          `interruption (mise en veille, micro coupé...). Vérifie le contenu avant de continuer.`
+      );
+    }
+
+    setPhase("stopped");
+  }
 
   async function startRecording() {
     setErrorMessage(null);
@@ -160,97 +239,42 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       const mimeType = pickMimeType();
-
-      let recorder: MediaRecorder;
-      try {
-        recorder = new MediaRecorder(stream, {
-          mimeType,
-          audioBitsPerSecond: AUDIO_BITS_PER_SECOND,
-        });
-      } catch {
-        // Au cas où le navigateur refuse audioBitsPerSecond pour ce mimeType.
-        recorder = new MediaRecorder(stream, { mimeType });
-      }
-      chunksRef.current = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
-      // `onstop` est le SEUL endroit fiable pour nettoyer : le navigateur
-      // peut arrêter le MediaRecorder de son propre chef quand la piste
-      // audio sous-jacente se termine (veille système, permission révoquée,
-      // périphérique débranché) sans jamais passer par notre fonction
-      // `stopRecording` — un premier test l'a confirmé : le chrono
-      // continuait de tourner après l'arrêt automatique parce que seule
-      // `stopRecording` coupait l'intervalle. On ne se fie donc plus à
-      // "est-ce que stopRecording a été appelé", mais à un flag explicite
-      // posé uniquement quand c'est l'utilisateur qui a cliqué sur Stop.
-      recorder.onstop = async () => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        releaseWakeLock();
-
-        if (!userInitiatedStopRef.current) {
-          setMicInterrupted(true);
-        }
-
-        const blob = new Blob(chunksRef.current, { type: mimeType });
-        audioBlobRef.current = blob;
-
-        // Vérifie que la durée réellement capturée correspond au temps
-        // écoulé — si le micro a été coupé en cours de route, ça se verra
-        // ici plutôt que de découvrir un fichier tronqué après coup.
-        const wallClockSeconds = startTimeRef.current
-          ? (Date.now() - startTimeRef.current) / 1000
-          : elapsed;
-        const actualDuration = await getAudioDuration(blob);
-        if (Number.isFinite(actualDuration) && actualDuration < wallClockSeconds * 0.9 - 5) {
-          const missing = Math.round(wallClockSeconds - actualDuration);
-          setDurationWarning(
-            `L'audio capturé (${formatElapsed(Math.round(actualDuration))}) est plus court que ` +
-              `la durée de l'enregistrement (${formatElapsed(Math.round(wallClockSeconds))}) : ` +
-              `environ ${formatElapsed(missing)} semblent manquants, probablement dus à une ` +
-              `interruption (mise en veille, micro coupé...). Vérifie le contenu avant de continuer.`
-          );
-        }
-
-        setPhase("stopped");
-      };
+      mimeTypeRef.current = mimeType;
+      segmentsRef.current = [];
+      isFinalStopRef.current = false;
 
       // Détecte une vraie coupure du micro (permission révoquée, appareil
       // déconnecté, ou accès suspendu par le système) pendant l'enregistrement
       // — plutôt que de laisser le chrono tourner sur un flux mort en silence.
-      // `onstop` ci-dessus fait déjà le ménage/la détection de toute façon ;
-      // ceci accélère juste l'arrêt effectif du MediaRecorder dès que la
-      // piste meurt, au lieu d'attendre le prochain chunk.
       const [track] = stream.getAudioTracks();
       if (track) {
         track.onended = () => {
           if (phaseRef.current === "recording") {
+            setMicInterrupted(true);
             stopRecording();
           }
         };
       }
 
-      userInitiatedStopRef.current = false;
-      recorder.start(1000);
-      mediaRecorderRef.current = recorder;
+      activeRecorderRef.current = createSegmentRecorder(stream, mimeType);
       setPhase("recording");
       setElapsed(0);
       startTimeRef.current = Date.now();
       acquireWakeLock();
 
-      // Le décompte se recalcule depuis l'horodatage de départ (pas un
-      // simple +1 par tick) : setInterval est fortement throttlé par les
+      // Le décompte affiché se recalcule depuis l'horodatage de départ (pas
+      // un simple +1 par tick) : setInterval est fortement throttlé par les
       // navigateurs quand l'onglet est en arrière-plan, mais dès qu'un tick
       // finit par s'exécuter, on retombe sur le vrai temps écoulé au lieu
       // d'accumuler un retard. L'enregistrement audio lui-même (MediaRecorder)
       // n'est pas concerné par ce throttling : il continue de capturer.
-      timerRef.current = setInterval(() => {
+      elapsedTimerRef.current = setInterval(() => {
         if (startTimeRef.current) {
           setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000));
         }
       }, 1000);
+
+      segmentTimerRef.current = setInterval(rotateSegment, SEGMENT_DURATION_MS);
     } catch (err) {
       setErrorMessage(
         "Impossible d'accéder au micro. Vérifie les autorisations de ton navigateur."
@@ -259,15 +283,14 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
   }
 
   function handleStopClick() {
-    userInitiatedStopRef.current = true;
     stopRecording();
   }
 
   function stopRecording() {
-    mediaRecorderRef.current?.stop();
+    isFinalStopRef.current = true;
+    if (segmentTimerRef.current) clearInterval(segmentTimerRef.current);
+    activeRecorderRef.current?.stop(); // déclenche onstop -> finalizeRecording
     streamRef.current?.getTracks().forEach((t) => t.stop());
-    if (timerRef.current) clearInterval(timerRef.current);
-    releaseWakeLock();
   }
 
   async function resolveSubjectId(userId: string): Promise<string | null> {
@@ -290,7 +313,8 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
   }
 
   async function submitCourse() {
-    if (!audioBlobRef.current) return;
+    const segments = segmentsRef.current;
+    if (segments.length === 0) return;
     setPhase("uploading");
     setErrorMessage(null);
 
@@ -303,21 +327,31 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
       const subjectIdResolved = await resolveSubjectId(user.id);
 
       const courseId = crypto.randomUUID();
-      const mimeType = audioBlobRef.current.type || "audio/webm";
+      const mimeType = segments[0].type || "audio/webm";
       const ext = mimeType.includes("mp4") ? "mp4" : mimeType.includes("ogg") ? "ogg" : "webm";
-      const path = `${user.id}/${courseId}.${ext}`;
+      // audio_path est désormais un PRÉFIXE de dossier (pas un fichier
+      // unique) : chaque segment y est déposé séparément, l'Edge Function
+      // les liste et les transcrit un par un avant de concaténer.
+      const prefix = `${user.id}/${courseId}`;
 
-      const { error: uploadError } = await supabase.storage
-        .from("course-audio")
-        .upload(path, audioBlobRef.current, { contentType: mimeType, upsert: true });
-      if (uploadError) throw uploadError;
+      await Promise.all(
+        segments.map((segment, i) => {
+          const segPath = `${prefix}/segment-${String(i).padStart(2, "0")}.${ext}`;
+          return supabase.storage
+            .from("course-audio")
+            .upload(segPath, segment, { contentType: mimeType, upsert: true })
+            .then(({ error }) => {
+              if (error) throw error;
+            });
+        })
+      );
 
       const { error: insertError } = await supabase.from("courses").insert({
         id: courseId,
         user_id: user.id,
         subject_id: subjectIdResolved,
         status: "processing",
-        audio_path: path,
+        audio_path: prefix,
       });
       if (insertError) throw insertError;
 

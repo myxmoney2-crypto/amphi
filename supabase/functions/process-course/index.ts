@@ -53,6 +53,48 @@ async function transcribeAudio(audioBlob: Blob, filename: string): Promise<strin
   return await res.text();
 }
 
+// Whisper plafonne à 25 Mo PAR FICHIER — un cours d'1h20+ dépasse cette
+// limite. `audio_path` pointe donc vers un DOSSIER de segments (chacun un
+// webm valide à part entière, produit par des MediaRecorder successifs côté
+// client, jamais un simple découpage d'octets) : on les liste, on les
+// transcrit un par un (séquentiellement, pour rester sous les limites de
+// débit de l'API), puis on concatène. Rétrocompatible avec les cours
+// enregistrés avant ce changement, où `audio_path` pointait directement
+// vers un fichier unique (le `list()` sur ce chemin renvoie alors une liste
+// vide, et on retombe sur un téléchargement direct).
+async function transcribeCourseAudio(
+  admin: SupabaseClient,
+  audioPathOrPrefix: string
+): Promise<string> {
+  const { data: entries } = await admin.storage.from("course-audio").list(audioPathOrPrefix);
+
+  const segmentPaths = (entries ?? [])
+    .filter((e: { name: string }) => e.name && !e.name.endsWith("/"))
+    .sort((a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name))
+    .map((e: { name: string }) => `${audioPathOrPrefix}/${e.name}`);
+
+  if (segmentPaths.length === 0) {
+    segmentPaths.push(audioPathOrPrefix);
+  }
+
+  const transcripts: string[] = [];
+  for (const path of segmentPaths) {
+    const { data: audioFile, error: downloadError } = await admin.storage
+      .from("course-audio")
+      .download(path);
+    if (downloadError || !audioFile) {
+      throw new Error(`Impossible de récupérer le segment audio : ${path}`);
+    }
+    if (audioFile.size < 1000) continue; // segment quasi vide (bascule juste avant l'arrêt) : ignoré
+
+    const filename = path.split("/").pop() || "segment.webm";
+    const text = await transcribeAudio(audioFile, filename);
+    if (text && text.trim()) transcripts.push(text.trim());
+  }
+
+  return transcripts.join("\n\n");
+}
+
 async function callClaudeTool(
   system: string,
   userContent: string,
@@ -220,13 +262,7 @@ async function processCourse(admin: SupabaseClient, courseId: string) {
     if (courseError || !course) throw new Error("Cours introuvable.");
     if (!course.audio_path) throw new Error("Aucun audio associé à ce cours.");
 
-    const { data: audioFile, error: downloadError } = await admin.storage
-      .from("course-audio")
-      .download(course.audio_path);
-    if (downloadError || !audioFile) throw new Error("Impossible de récupérer le fichier audio.");
-
-    const filename = course.audio_path.split("/").pop() || "cours.webm";
-    const rawTranscript = await transcribeAudio(audioFile, filename);
+    const rawTranscript = await transcribeCourseAudio(admin, course.audio_path);
     if (!rawTranscript || rawTranscript.trim().length < 20) {
       throw new Error(
         "La transcription est vide — l'audio est peut-être trop court ou inaudible."

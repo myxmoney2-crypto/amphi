@@ -1,5 +1,6 @@
 import HoloBlob from "@/components/landing/HoloBlob";
 import AmphiScene from "@/components/landing/AmphiScene";
+import Logo from "@/components/ui/Logo";
 import { createClient } from "@/lib/supabase/server";
 
 export default async function LandingPage() {
@@ -42,7 +43,7 @@ export default async function LandingPage() {
       />
 
       <header className="relative z-10 flex items-center justify-between px-6 py-6 md:px-12">
-        <span className="text-2xl font-black tracking-tight text-ink">AMFI</span>
+        <Logo />
         <nav>
           <a
             href={user ? "/dashboard" : "/login"}

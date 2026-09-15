@@ -3,6 +3,7 @@
 import { Suspense, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
+import Logo from "@/components/ui/Logo";
 
 export default function SignupPage() {
   return (
@@ -65,8 +66,8 @@ function SignupForm() {
   return (
     <main className="flex min-h-screen items-center justify-center bg-gradient-to-b from-paleblue to-cream px-6">
       <div className="w-full max-w-sm">
-        <a href="/" className="mb-8 block text-center text-2xl font-black text-ink">
-          AMFI
+        <a href="/" className="mb-8 flex justify-center">
+          <Logo />
         </a>
         <div className="rounded-3xl border border-ink/10 bg-white/80 p-8 shadow-sm backdrop-blur">
           <h1 className="text-xl font-bold text-ink">Créer un compte</h1>
