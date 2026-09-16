@@ -93,6 +93,21 @@ async function getTotalAudioDuration(segments: Blob[]): Promise<number> {
   return durations.reduce((total, d) => total + (Number.isFinite(d) ? d : 0), 0);
 }
 
+type SegmentUpload = {
+  blob: Blob;
+  path: string;
+  state: "pending" | "uploading" | "uploaded" | "error";
+  // Promesse de l'upload EN COURS, s'il y en a un — évite qu'un second appel
+  // concurrent (ex. finalizeRecording qui vérifie tout juste après que le
+  // onstop du dernier segment a lancé son propre upload) ne relance le même
+  // envoi en double.
+  inFlight: Promise<void> | null;
+};
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export default function Recorder({ initialSubjects }: { initialSubjects: Subject[] }) {
   const router = useRouter();
   const supabase = createClient();
@@ -108,11 +123,22 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [durationWarning, setDurationWarning] = useState<string | null>(null);
   const [micInterrupted, setMicInterrupted] = useState(false);
+  const [segmentsSaved, setSegmentsSaved] = useState(0);
+  const [segmentsPending, setSegmentsPending] = useState(0);
 
   const activeRecorderRef = useRef<MediaRecorder | null>(null);
-  const segmentsRef = useRef<Blob[]>([]); // segments audio terminés, prêts à uploader
+  const segmentsRef = useRef<Blob[]>([]); // segments audio terminés (pour le contrôle de durée)
+  // Chaque segment est envoyé au storage DÈS qu'il est terminé, pas attendu
+  // jusqu'à la fin de l'enregistrement — voir uploadSegment() : c'est ce qui
+  // garantit qu'un crash/fermeture d'onglet en cours de route ne perd que le
+  // segment en cours, jamais ceux déjà capturés.
+  const uploadsRef = useRef<SegmentUpload[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
   const mimeTypeRef = useRef<string>("audio/webm");
+  const extRef = useRef<string>("webm");
+  const coursePrefixRef = useRef<string | null>(null);
+  const courseIdRef = useRef<string | null>(null);
+  const subjectIdRef = useRef<string | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const segmentTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number | null>(null);
@@ -165,8 +191,56 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
     };
   }, []);
 
+  function refreshUploadCounters() {
+    const uploads = uploadsRef.current;
+    setSegmentsSaved(uploads.filter((u) => u.state === "uploaded").length);
+    setSegmentsPending(uploads.filter((u) => u.state !== "uploaded").length);
+  }
+
+  /** Envoie un segment vers Supabase Storage, avec quelques tentatives en
+   * cas de coupure réseau passagère — c'est CETTE fonction, appelée dès
+   * qu'un segment est terminé (pas à la toute fin de l'enregistrement), qui
+   * garantit que les segments déjà capturés survivent à un crash ou une
+   * fermeture d'onglet plus tard dans le cours. */
+  function uploadSegment(upload: SegmentUpload): Promise<void> {
+    if (upload.inFlight) return upload.inFlight; // déjà en cours, on rattache à ce même envoi
+    if (upload.state === "uploaded") return Promise.resolve();
+
+    const run = async () => {
+      upload.state = "uploading";
+      refreshUploadCounters();
+      const attempts = 4;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          const { error } = await supabase.storage
+            .from("course-audio")
+            .upload(upload.path, upload.blob, {
+              contentType: upload.blob.type || "audio/webm",
+              upsert: true,
+            });
+          if (error) throw error;
+          upload.state = "uploaded";
+          refreshUploadCounters();
+          return;
+        } catch {
+          if (attempt < attempts) {
+            await sleep(1000 * attempt);
+          }
+        }
+      }
+      upload.state = "error";
+      refreshUploadCounters();
+    };
+
+    upload.inFlight = run().finally(() => {
+      upload.inFlight = null;
+    });
+    return upload.inFlight;
+  }
+
   /** Crée et démarre un nouveau MediaRecorder sur le flux courant ; son
-   * propre `onstop` empile le segment terminé dans `segmentsRef`. */
+   * propre `onstop` empile le segment terminé dans `segmentsRef` et lance
+   * immédiatement son upload. */
   function createSegmentRecorder(stream: MediaStream, mimeType: string): MediaRecorder {
     let recorder: MediaRecorder;
     try {
@@ -184,7 +258,18 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
     // terminée) sans jamais passer par notre code — un test l'a confirmé.
     recorder.onstop = () => {
       if (myChunks.length > 0) {
-        segmentsRef.current.push(new Blob(myChunks, { type: mimeType }));
+        const blob = new Blob(myChunks, { type: mimeType });
+        segmentsRef.current.push(blob);
+
+        const prefix = coursePrefixRef.current;
+        if (prefix) {
+          const index = uploadsRef.current.length;
+          const path = `${prefix}/segment-${String(index).padStart(2, "0")}.${extRef.current}`;
+          const upload: SegmentUpload = { blob, path, state: "pending", inFlight: null };
+          uploadsRef.current.push(upload);
+          refreshUploadCounters();
+          void uploadSegment(upload);
+        }
       }
       if (isFinalStopRef.current) {
         finalizeRecording();
@@ -210,6 +295,13 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
     if (segmentTimerRef.current) clearInterval(segmentTimerRef.current);
     releaseWakeLock();
 
+    // Le dernier segment vient d'être mis en file d'upload (dans onstop,
+    // juste avant cet appel) — on attend que TOUS les uploads (y compris les
+    // précédents encore en cours) soient terminés avant de considérer
+    // l'enregistrement comme prêt. uploadSegment() se rattache à un envoi
+    // déjà en cours plutôt que de le relancer en double.
+    await Promise.all(uploadsRef.current.map((u) => uploadSegment(u)));
+
     // Vérifie que la durée réellement capturée (somme des segments)
     // correspond au temps écoulé — si le micro a été coupé en cours de
     // route, ça se verra ici plutôt que de découvrir un fichier tronqué
@@ -231,16 +323,65 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
     setPhase("stopped");
   }
 
+  async function resolveSubjectId(userId: string): Promise<string | null> {
+    if (subjectId === "new") {
+      const name = newSubjectName.trim();
+      if (!name) return null;
+      const existing = subjects.find((s) => s.name.toLowerCase() === name.toLowerCase());
+      if (existing) return existing.id;
+
+      const { data, error } = await supabase
+        .from("subjects")
+        .insert({ user_id: userId, name })
+        .select()
+        .single();
+      if (error) throw error;
+      setSubjects((prev) => [...prev, data as Subject]);
+      return (data as Subject).id;
+    }
+    return subjectId || null;
+  }
+
   async function startRecording() {
     setErrorMessage(null);
     setDurationWarning(null);
     setMicInterrupted(false);
     try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) throw new Error("Session expirée, reconnecte-toi.");
+      const subjectIdResolved = await resolveSubjectId(user.id);
+
+      // Le cours est créé EN BASE dès le tout début de l'enregistrement
+      // (statut "recording"), pas seulement une fois que l'utilisateur
+      // clique sur "Terminer et traiter" : ainsi, même si l'onglet se ferme
+      // ou plante en cours de route, les segments déjà envoyés au storage
+      // restent rattachés à un cours réel qu'on peut traiter avec ce qui a
+      // été capturé, au lieu de tout perdre.
+      const courseId = crypto.randomUUID();
+      const prefix = `${user.id}/${courseId}`;
+      const { error: insertError } = await supabase.from("courses").insert({
+        id: courseId,
+        user_id: user.id,
+        subject_id: subjectIdResolved,
+        status: "recording",
+        audio_path: prefix,
+      });
+      if (insertError) throw insertError;
+      courseIdRef.current = courseId;
+      coursePrefixRef.current = prefix;
+      subjectIdRef.current = subjectIdResolved;
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       const mimeType = pickMimeType();
       mimeTypeRef.current = mimeType;
+      extRef.current = mimeType.includes("mp4") ? "mp4" : mimeType.includes("ogg") ? "ogg" : "webm";
       segmentsRef.current = [];
+      uploadsRef.current = [];
+      setSegmentsSaved(0);
+      setSegmentsPending(0);
       isFinalStopRef.current = false;
 
       // Détecte une vraie coupure du micro (permission révoquée, appareil
@@ -275,9 +416,21 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
       }, 1000);
 
       segmentTimerRef.current = setInterval(rotateSegment, SEGMENT_DURATION_MS);
-    } catch (err) {
+    } catch (err: any) {
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      // Le micro a pu refuser APRÈS la création du cours (statut "recording",
+      // encore aucun segment) : on le supprime plutôt que de laisser un cours
+      // vide traîner dans le dashboard.
+      if (courseIdRef.current && uploadsRef.current.length === 0) {
+        await supabase.from("courses").delete().eq("id", courseIdRef.current);
+      }
+      courseIdRef.current = null;
+      coursePrefixRef.current = null;
       setErrorMessage(
-        "Impossible d'accéder au micro. Vérifie les autorisations de ton navigateur."
+        err?.message === "Session expirée, reconnecte-toi."
+          ? err.message
+          : "Impossible d'accéder au micro. Vérifie les autorisations de ton navigateur."
       );
     }
   }
@@ -293,67 +446,24 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
     streamRef.current?.getTracks().forEach((t) => t.stop());
   }
 
-  async function resolveSubjectId(userId: string): Promise<string | null> {
-    if (subjectId === "new") {
-      const name = newSubjectName.trim();
-      if (!name) return null;
-      const existing = subjects.find((s) => s.name.toLowerCase() === name.toLowerCase());
-      if (existing) return existing.id;
-
-      const { data, error } = await supabase
-        .from("subjects")
-        .insert({ user_id: userId, name })
-        .select()
-        .single();
-      if (error) throw error;
-      setSubjects((prev) => [...prev, data as Subject]);
-      return (data as Subject).id;
-    }
-    return subjectId || null;
-  }
-
   async function submitCourse() {
-    const segments = segmentsRef.current;
-    if (segments.length === 0) return;
+    const courseId = courseIdRef.current;
+    if (!courseId) return;
     setPhase("uploading");
     setErrorMessage(null);
 
     try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) throw new Error("Session expirée, reconnecte-toi.");
-
-      const subjectIdResolved = await resolveSubjectId(user.id);
-
-      const courseId = crypto.randomUUID();
-      const mimeType = segments[0].type || "audio/webm";
-      const ext = mimeType.includes("mp4") ? "mp4" : mimeType.includes("ogg") ? "ogg" : "webm";
-      // audio_path est désormais un PRÉFIXE de dossier (pas un fichier
-      // unique) : chaque segment y est déposé séparément, l'Edge Function
-      // les liste et les transcrit un par un avant de concaténer.
-      const prefix = `${user.id}/${courseId}`;
-
-      await Promise.all(
-        segments.map((segment, i) => {
-          const segPath = `${prefix}/segment-${String(i).padStart(2, "0")}.${ext}`;
-          return supabase.storage
-            .from("course-audio")
-            .upload(segPath, segment, { contentType: mimeType, upsert: true })
-            .then(({ error }) => {
-              if (error) throw error;
-            });
-        })
-      );
-
-      const { error: insertError } = await supabase.from("courses").insert({
-        id: courseId,
-        user_id: user.id,
-        subject_id: subjectIdResolved,
-        status: "processing",
-        audio_path: prefix,
-      });
-      if (insertError) throw insertError;
+      // Les segments sont déjà envoyés au fil de l'enregistrement — ici on
+      // s'assure juste qu'aucun n'est resté en échec (coupure réseau...)
+      // avant de lancer le traitement.
+      await Promise.all(uploadsRef.current.map((u) => uploadSegment(u)));
+      const stillFailed = uploadsRef.current.filter((u) => u.state !== "uploaded");
+      if (stillFailed.length > 0) {
+        throw new Error(
+          `${stillFailed.length} segment(s) audio n'ont pas pu être envoyés (connexion instable). ` +
+            `Réessaie — les autres segments déjà envoyés sont conservés.`
+        );
+      }
 
       setPhase("processing");
 
@@ -435,6 +545,13 @@ export default function Recorder({ initialSubjects }: { initialSubjects: Subject
             <p className="mt-1 text-xs text-ink/40">
               Tu peux changer d'onglet, l'enregistrement continue en arrière-plan.
             </p>
+            {segmentsSaved + segmentsPending > 0 && (
+              <p className="mt-2 text-xs text-ink/40">
+                {segmentsSaved} segment{segmentsSaved > 1 ? "s" : ""} déjà sauvegardé
+                {segmentsSaved > 1 ? "s" : ""}
+                {segmentsPending > 0 ? ` · ${segmentsPending} en cours d'envoi...` : ""}
+              </p>
+            )}
             <button
               onClick={handleStopClick}
               className="mt-6 flex h-20 w-20 items-center justify-center rounded-full bg-ink text-cream shadow-lg transition hover:scale-105"

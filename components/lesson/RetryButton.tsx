@@ -3,7 +3,13 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
-export default function RetryButton({ courseId }: { courseId: string }) {
+export default function RetryButton({
+  courseId,
+  label = "Réessayer",
+}: {
+  courseId: string;
+  label?: string;
+}) {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
 
@@ -24,7 +30,7 @@ export default function RetryButton({ courseId }: { courseId: string }) {
       disabled={loading}
       className="mt-2 rounded-full border border-ink px-6 py-3 text-sm font-semibold text-ink disabled:opacity-50"
     >
-      {loading ? "Relance..." : "Réessayer"}
+      {loading ? "Relance..." : label}
     </button>
   );
 }

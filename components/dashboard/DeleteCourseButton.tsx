@@ -20,7 +20,15 @@ export default function DeleteCourseButton({
     const supabase = createClient();
 
     if (audioPath) {
-      await supabase.storage.from("course-audio").remove([audioPath]);
+      // audioPath est un PRÉFIXE de dossier (un segment par fichier), pas un
+      // fichier unique : il faut lister le dossier avant de pouvoir
+      // supprimer ce qu'il contient.
+      const { data: files } = await supabase.storage.from("course-audio").list(audioPath);
+      if (files && files.length > 0) {
+        await supabase.storage
+          .from("course-audio")
+          .remove(files.map((f) => `${audioPath}/${f.name}`));
+      }
     }
 
     // lessons/quizzes/mindmaps partent en cascade (on delete cascade en base).

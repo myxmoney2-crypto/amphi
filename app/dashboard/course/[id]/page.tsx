@@ -44,6 +44,41 @@ export default async function CoursePage({ params }: { params: { id: string } })
     );
   }
 
+  if (course.status === "recording") {
+    const { data: files } = course.audio_path
+      ? await supabase.storage.from("course-audio").list(course.audio_path)
+      : { data: null };
+    const segmentCount = files?.length ?? 0;
+
+    return (
+      <div className="flex flex-col items-center gap-3 py-24 text-center">
+        <h1 className="text-xl font-bold text-ink">{title}</h1>
+        <p className="max-w-md text-sm text-ink/60">
+          Cet enregistrement n'a pas été terminé normalement (onglet fermé, connexion coupée...).
+          {segmentCount > 0
+            ? ` Bonne nouvelle : ${segmentCount} segment${segmentCount > 1 ? "s ont" : " a"} bien été sauvegardé${segmentCount > 1 ? "s" : ""} avant l'interruption et peu${segmentCount > 1 ? "vent" : "t"} être traités tel quel.`
+            : " Aucun segment n'a malheureusement été sauvegardé avant l'interruption."}
+        </p>
+        {segmentCount > 0 ? (
+          <>
+            <RetryButton courseId={course.id} label="Traiter avec l'audio déjà capturé" />
+            <p className="max-w-sm text-xs text-ink/40">
+              Si tu es encore en train d'enregistrer ce cours dans un autre onglet, termine-le
+              d'abord là-bas plutôt que de cliquer ici.
+            </p>
+          </>
+        ) : (
+          <a
+            href="/dashboard/new"
+            className="mt-2 rounded-full bg-ink px-6 py-3 text-sm font-semibold text-cream"
+          >
+            Ré-enregistrer ce cours
+          </a>
+        )}
+      </div>
+    );
+  }
+
   if (course.status === "error") {
     return (
       <div className="flex flex-col items-center gap-3 py-24 text-center">
