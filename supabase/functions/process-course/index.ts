@@ -1,11 +1,26 @@
 // Edge Function Supabase (Deno) — traitement asynchrone d'un cours.
 //
 // Déclenchée par une requête POST courte depuis l'app Next.js ({ courseId }).
-// Elle répond immédiatement (202) puis continue le vrai travail (Whisper +
-// Claude, potentiellement plusieurs minutes) en arrière-plan via
-// EdgeRuntime.waitUntil — donc complètement affranchie de la limite de 60s
-// des fonctions serverless Vercel. Le statut du cours (`processing` →
-// `done`/`error`) est mis à jour en base ; le front s'y abonne en Realtime.
+// Elle répond immédiatement (202) puis continue le vrai travail en
+// arrière-plan via EdgeRuntime.waitUntil — donc affranchie de la limite de
+// 60s des fonctions serverless Vercel.
+//
+// MAIS les Edge Functions Supabase ont elles-mêmes une limite de temps
+// d'exécution "wall clock" par appel (150s sur le plan gratuit, 400s sur les
+// plans payants — https://supabase.com/docs/guides/functions/limits), qui
+// s'applique aussi au travail fait dans waitUntil. Transcrire tous les
+// segments d'un cours long (1h15+, 5 segments et plus) à la suite dans UN
+// SEUL appel dépassait cette limite. La transcription est donc découpée en
+// une CHAÎNE d'appels séparés à cette même fonction, un par segment : chaque
+// appel transcrit un seul segment (~15min d'audio, largement sous la
+// limite), dépose sa transcription dans course_segment_transcripts, puis
+// déclenche l'appel suivant (segment suivant, ou "finalize" après le
+// dernier) sans jamais attendre que celui-ci se termine. La durée totale du
+// cours n'est donc plus jamais bornée par la limite d'un seul appel, que ce
+// soit 5 segments ou 15 (jusqu'à 3h de cours).
+//
+// Le statut du cours (`processing` → `done`/`error`) est mis à jour en
+// base ; le front s'y abonne en Realtime.
 //
 // Déploiement : supabase functions deploy process-course
 // Secrets requis : supabase secrets set OPENAI_API_KEY=... ANTHROPIC_API_KEY=...
@@ -56,16 +71,15 @@ async function transcribeAudio(audioBlob: Blob, filename: string): Promise<strin
 // Whisper plafonne à 25 Mo PAR FICHIER — un cours d'1h20+ dépasse cette
 // limite. `audio_path` pointe donc vers un DOSSIER de segments (chacun un
 // webm valide à part entière, produit par des MediaRecorder successifs côté
-// client, jamais un simple découpage d'octets) : on les liste, on les
-// transcrit un par un (séquentiellement, pour rester sous les limites de
-// débit de l'API), puis on concatène. Rétrocompatible avec les cours
-// enregistrés avant ce changement, où `audio_path` pointait directement
-// vers un fichier unique (le `list()` sur ce chemin renvoie alors une liste
-// vide, et on retombe sur un téléchargement direct).
-async function transcribeCourseAudio(
+// client, jamais un simple découpage d'octets). Rétrocompatible avec les
+// cours enregistrés avant ce changement, où `audio_path` pointait
+// directement vers un fichier unique (le `list()` sur ce chemin renvoie
+// alors une liste vide, et on retombe sur ce fichier unique comme "segment
+// 0").
+async function listCourseSegments(
   admin: SupabaseClient,
   audioPathOrPrefix: string
-): Promise<string> {
+): Promise<string[]> {
   const { data: entries } = await admin.storage.from("course-audio").list(audioPathOrPrefix);
 
   const segmentPaths = (entries ?? [])
@@ -73,26 +87,7 @@ async function transcribeCourseAudio(
     .sort((a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name))
     .map((e: { name: string }) => `${audioPathOrPrefix}/${e.name}`);
 
-  if (segmentPaths.length === 0) {
-    segmentPaths.push(audioPathOrPrefix);
-  }
-
-  const transcripts: string[] = [];
-  for (const path of segmentPaths) {
-    const { data: audioFile, error: downloadError } = await admin.storage
-      .from("course-audio")
-      .download(path);
-    if (downloadError || !audioFile) {
-      throw new Error(`Impossible de récupérer le segment audio : ${path}`);
-    }
-    if (audioFile.size < 1000) continue; // segment quasi vide (bascule juste avant l'arrêt) : ignoré
-
-    const filename = path.split("/").pop() || "segment.webm";
-    const text = await transcribeAudio(audioFile, filename);
-    if (text && text.trim()) transcripts.push(text.trim());
-  }
-
-  return transcripts.join("\n\n");
+  return segmentPaths.length > 0 ? segmentPaths : [audioPathOrPrefix];
 }
 
 async function callClaudeTool(
@@ -252,17 +247,111 @@ async function generateCoursePackage(rawTranscript: string) {
   };
 }
 
-async function processCourse(admin: SupabaseClient, courseId: string) {
+// Déclenche l'étape suivante de la chaîne (segment suivant, ou "finalize")
+// via un appel HTTP à cette même fonction — SANS attendre que cette étape
+// se termine : on veut juste être sûr qu'elle a bien démarré. L'étape
+// appelée répond elle aussi immédiatement (202) et fait son propre travail
+// dans SON PROPRE waitUntil, donc ce `fetch` ne bloque que le temps d'un
+// aller-retour réseau, jamais le temps du traitement réel.
+async function triggerNextStep(
+  courseId: string,
+  payload: { segmentIndex: number } | { phase: "finalize" }
+) {
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/process-course`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      Authorization: `Bearer ${SERVICE_ROLE_KEY}`,
+    },
+    body: JSON.stringify({ courseId, ...payload }),
+  });
+  if (!res.ok) {
+    throw new Error(`Étape suivante du traitement injoignable (${res.status}).`);
+  }
+}
+
+async function markError(admin: SupabaseClient, courseId: string, err: unknown) {
+  const message = err instanceof Error ? err.message : "Erreur inconnue pendant le traitement.";
+  await admin.from("courses").update({ status: "error", error_message: message }).eq(
+    "id",
+    courseId
+  );
+}
+
+// Traite UN SEUL segment (téléchargement + Whisper), dépose sa
+// transcription, puis déclenche l'étape suivante de la chaîne. Chaque appel
+// reste largement sous la limite de temps d'exécution d'une Edge Function,
+// quelle que soit la longueur totale du cours.
+async function processSegmentStep(admin: SupabaseClient, courseId: string, segmentIndex: number) {
   try {
     const { data: course, error: courseError } = await admin
       .from("courses")
-      .select("*")
+      .select("status, audio_path")
       .eq("id", courseId)
       .single();
     if (courseError || !course) throw new Error("Cours introuvable.");
+    // Le cours a pu être supprimé, ou une étape précédente de LA MÊME chaîne
+    // a déjà basculé le statut sur "error" : on arrête la chaîne ici plutôt
+    // que de continuer à transcrire pour rien.
+    if (course.status !== "processing") return;
     if (!course.audio_path) throw new Error("Aucun audio associé à ce cours.");
 
-    const rawTranscript = await transcribeCourseAudio(admin, course.audio_path);
+    const segmentPaths = await listCourseSegments(admin, course.audio_path);
+
+    if (segmentIndex < segmentPaths.length) {
+      const path = segmentPaths[segmentIndex];
+      const { data: audioFile, error: downloadError } = await admin.storage
+        .from("course-audio")
+        .download(path);
+      if (downloadError || !audioFile) {
+        throw new Error(`Impossible de récupérer le segment audio : ${path}`);
+      }
+
+      if (audioFile.size >= 1000) {
+        // segment quasi vide (bascule juste avant l'arrêt) : ignoré
+        const filename = path.split("/").pop() || "segment.webm";
+        const text = await transcribeAudio(audioFile, filename);
+        if (text && text.trim()) {
+          const { error: insertError } = await admin.from("course_segment_transcripts").upsert(
+            { course_id: courseId, segment_index: segmentIndex, transcript: text.trim() },
+            { onConflict: "course_id,segment_index" }
+          );
+          if (insertError) throw insertError;
+        }
+      }
+    }
+
+    const isLast = segmentIndex + 1 >= segmentPaths.length;
+    await triggerNextStep(
+      courseId,
+      isLast ? { phase: "finalize" } : { segmentIndex: segmentIndex + 1 }
+    );
+  } catch (err) {
+    await markError(admin, courseId, err);
+  }
+}
+
+// Dernière étape de la chaîne : relit toutes les transcriptions de segments
+// déposées par les étapes précédentes, les concatène dans l'ordre, puis fait
+// l'unique appel Claude qui structure leçon + quiz + carte mentale.
+async function finalizeCourse(admin: SupabaseClient, courseId: string) {
+  try {
+    const { data: course, error: courseError } = await admin
+      .from("courses")
+      .select("status")
+      .eq("id", courseId)
+      .single();
+    if (courseError || !course) throw new Error("Cours introuvable.");
+    if (course.status !== "processing") return;
+
+    const { data: rows, error: transcriptsError } = await admin
+      .from("course_segment_transcripts")
+      .select("segment_index, transcript")
+      .eq("course_id", courseId)
+      .order("segment_index", { ascending: true });
+    if (transcriptsError) throw transcriptsError;
+
+    const rawTranscript = (rows ?? []).map((r) => r.transcript as string).join("\n\n");
     if (!rawTranscript || rawTranscript.trim().length < 20) {
       throw new Error(
         "La transcription est vide — l'audio est peut-être trop court ou inaudible."
@@ -291,12 +380,12 @@ async function processCourse(admin: SupabaseClient, courseId: string) {
       .update({ status: "done", title, error_message: null })
       .eq("id", courseId);
     if (updateError) throw updateError;
+
+    // Nettoyage : plus besoin des transcriptions intermédiaires une fois le
+    // cours structuré. Non bloquant si ça échoue (pas grave si ça traîne).
+    await admin.from("course_segment_transcripts").delete().eq("course_id", courseId);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Erreur inconnue pendant le traitement.";
-    await admin.from("courses").update({ status: "error", error_message: message }).eq(
-      "id",
-      courseId
-    );
+    await markError(admin, courseId, err);
   }
 }
 
@@ -306,8 +395,10 @@ Deno.serve(async (req) => {
   }
 
   let courseId: string | undefined;
+  let segmentIndex: number | undefined;
+  let phase: string | undefined;
   try {
-    ({ courseId } = await req.json());
+    ({ courseId, segmentIndex, phase } = await req.json());
   } catch {
     return new Response(JSON.stringify({ error: "Corps JSON invalide." }), { status: 400 });
   }
@@ -317,10 +408,15 @@ Deno.serve(async (req) => {
 
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-  // Lance le traitement en arrière-plan et répond tout de suite : le client
-  // n'attend jamais la fin de la transcription/structuration.
+  // Lance cette étape en arrière-plan et répond tout de suite : ni le client
+  // Next.js (pour le tout premier appel) ni l'étape précédente de la chaîne
+  // (pour les suivantes) n'attendent la fin du traitement réel.
   // @ts-ignore — EdgeRuntime est fourni par le runtime Supabase Edge Functions.
-  EdgeRuntime.waitUntil(processCourse(admin, courseId));
+  EdgeRuntime.waitUntil(
+    phase === "finalize"
+      ? finalizeCourse(admin, courseId)
+      : processSegmentStep(admin, courseId, segmentIndex ?? 0)
+  );
 
   return new Response(JSON.stringify({ started: true, courseId }), {
     status: 202,
